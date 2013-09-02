@@ -12,10 +12,11 @@
 // Default Configuration
 //########################################################################################################################
 #define destNodeID 1
-#define myNodeID 17      // RF12 node ID in the range 1-30
-
+#define myNodeID 30      // RF12 node ID in the range 1-30
+// 17 for LDC
 #define AS_PHOTOCELL 1
-#define AS_TWO_TEMP_PROBES 1
+//#define AS_TWO_TEMP_PROBES 1
+#define STATIC_ONEWIRE_INDEXES 1 // Save time and 118 Bytes of code : good for ATTiny !
 
 //########################################################################################################################
 // General Configuration
@@ -30,7 +31,8 @@
 
 #include <OneWire.h>   // http://www.pjrc.com/teensy/arduino_libraries/OneWire.zip
 #include <DallasTemperature.h>  // http://download.milesburton.com/Arduino/MaximTemperature/DallasTemperature_371Beta.zip
-#define TEMPERATURE_PRECISION 9
+//#define TEMPERATURE_PRECISION 9
+#define ASYNC_DELAY 750 // 9bit requres 95ms, 10bit 187ms, 11bit 375ms and 12bit resolution takes 750ms
  
 #define ONE_WIRE_BUS PIN_A7    // pad 5 of the Funky
 #define tempPower PIN_A3       // Power pin is connected pad 4 on the Funky
@@ -77,9 +79,12 @@ void RF_air_send(Payload_t *pl);
 // Setup a oneWire instance to communicate with any OneWire devices 
 // (not just Maxim/Dallas temperature ICs)
 OneWire oneWire(ONE_WIRE_BUS);
- 
 // Pass our oneWire reference to Dallas Temperature.
 DallasTemperature sensors(&oneWire);
+#ifdef STATIC_ONEWIRE_INDEXES
+// addresses of sensors, MAX 4!!  
+byte allAddress [4][8];  // 8 bytes per address
+#endif
 
 volatile bool adcDone;
 
@@ -145,14 +150,22 @@ static unsigned int adcMeanRead(byte adcmux, unsigned int count = 10, bool tovdc
 static int readDS18120(void)
 {
   int result = 0;
-  pinMode(tempPower, OUTPUT); // set power pin for DS18B20 to output  
-  digitalWrite(tempPower, HIGH); // turn DS18B20 sensor on
-  Sleepy::loseSomeTime(20); // Allow 10ms for the sensor to be ready
-  sensors.requestTemperatures(); // Send the command to get temperatures
+  pinMode(tempPower, OUTPUT);     // set power pin for DS18B20 to output  
+  digitalWrite(tempPower, HIGH);  // turn DS18B20 sensor on
+  loseSomeTime(20);               // Allow 10ms for the sensor to be ready
+  sensors.requestTemperatures();  // Send the command to get temperatures
+  loseSomeTime(ASYNC_DELAY);           // Must wait for conversion, since we use ASYNC mode
   
+#ifdef STATIC_ONEWIRE_INDEXES 
+  staticpayload.temp1 = sensors.getTempC(allAddress[0])*100; // Read Probe 1
+#ifdef AS_TWO_TEMP_PROBES
+  staticpayload.temp2 = sensors.getTempC(allAddress[1])*100; // Read Probe 2
+#endif
+#else  
   staticpayload.temp1 = sensors.getTempCByIndex(0)*100; // Read Probe 1
 #ifdef AS_TWO_TEMP_PROBES
   staticpayload.temp2 = sensors.getTempCByIndex(1)*100; // Read Probe 2
+#endif
 #endif
 
   digitalWrite(tempPower, LOW); // turn DS18B20 sensor off
@@ -162,11 +175,11 @@ static int readDS18120(void)
 static void blinkLED(int ntimes, int time){
   for (int i = 0; i <= ntimes; ++i) {
       digitalWrite(LEDpin,LOW);
-      Sleepy::loseSomeTime(time/2);
+      loseSomeTime(time/2);
       //delay(time/2);
       digitalWrite(LEDpin,HIGH);
       //delay(time/2);
-      Sleepy::loseSomeTime(time/2);
+      loseSomeTime(time/2);
   }
   //delay(1000);
 }
@@ -193,7 +206,7 @@ void RF_air_send(Payload_t *pl){
        rf12_sleep(RF12_SLEEP);
 #if NEED_ACK
        if (acked) { break; }      // Return if ACK received
-       Sleepy::loseSomeTime(RETRY_PERIOD * 500);     // If no ack received wait and try again
+       loseSomeTime(RETRY_PERIOD * 500);     // If no ack received wait and try again
 #else
         break;
 #endif
@@ -233,10 +246,18 @@ void setup() {
    /* Setup Dallas Temp probe */
    pinMode(tempPower, OUTPUT); // set power pin for DS18B20 to output
    digitalWrite(tempPower, HIGH); // turn sensor power on
-   Sleepy::loseSomeTime(50); // Allow 50ms for the sensor to be ready
+   loseSomeTime(50); // Allow 50ms for the sensor to be ready
    // Start up the library
-   sensors.begin(); 
+   sensors.begin();
+   sensors.setWaitForConversion(false); 
    staticpayload.numsensors = sensors.getDeviceCount();
+
+#ifdef STATIC_ONEWIRE_INDEXES
+    byte j=0;   // search for one wire devices and
+    while ((j < staticpayload.numsensors) && (oneWire.search(allAddress[j]))) {        
+      j++;
+    }
+#endif
    
 #ifdef AS_PHOTOCELL
    digitalWrite(PHOTOCELLpin, LOW); // Turns pull up off
@@ -248,7 +269,7 @@ void setup() {
 
 void loop() {
    bitClear(PRR, PRADC); // power up the ADC
-   Sleepy::loseSomeTime(16); // Allow 10ms for the sensor to be ready
+   loseSomeTime(16); // Allow 10ms for the sensor to be ready
   
    staticpayload.supplyV = vccRead(4);
    // staticpayload temp1 & temp2 set according configuration
@@ -269,8 +290,8 @@ void loop() {
    RF_air_send(&staticpayload);
   
    for (byte i = 0; i < 5; ++i)
-     Sleepy::loseSomeTime(60*1000);
-     //Sleepy::loseSomeTime(1*1000);
+     //loseSomeTime(60*1000);
+     loseSomeTime(1*1000);
 }
 
 static byte waitForAck() {
@@ -280,6 +301,18 @@ static byte waitForAck() {
      return 1;
    }
    return 0;
+}
+
+void loseSomeTime(unsigned int ms){
+    byte oldADCSRA=ADCSRA;      // Save ADC state
+    byte oldADCSRB=ADCSRB;
+    byte oldADMUX=ADMUX;
+    
+    Sleepy::loseSomeTime(ms);   // JeeLabs power save function: enter low power mode for x seconds (valid range 16-65000 ms)
+    
+    ADCSRA=oldADCSRA;           // Restore ADC state
+    ADCSRB=oldADCSRB;
+    ADMUX=oldADMUX;    
 }
 
 
