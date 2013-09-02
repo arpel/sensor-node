@@ -1,14 +1,25 @@
 //--------------------------------------------------------------------------------------
-// Internal temperature measurement of Attiny84 based TinySensor
-// harizanov.com
+// Internal temperature measurement of Attiny84 based FunkySensor derivative
+// based on work from harizanov.com and jeelabs.org
+// Arpel @ 2012-2013
 // GNU GPL V3
 //--------------------------------------------------------------------------------------
 #include <JeeLib.h> // https://github.com/jcw/jeelib
 #include "pins_arduino.h"
 #include <avr/sleep.h>
 
+//########################################################################################################################
+// Default Configuration
+//########################################################################################################################
 #define destNodeID 1
 #define myNodeID 17      // RF12 node ID in the range 1-30
+
+#define AS_PHOTOCELL 1
+#define AS_TWO_TEMP_PROBES 1
+
+//########################################################################################################################
+// General Configuration
+//########################################################################################################################
 #define network 100      // RF12 Network group
 #define freq RF12_868MHZ // Frequency of RFM12B module
 
@@ -25,8 +36,6 @@
 #define tempPower PIN_A3       // Power pin is connected pad 4 on the Funky
 #define LEDpin PIN_A0
 
-#define AS_PHOTOCELL 1
-
 #ifdef AS_PHOTOCELL
 #define PHOTOCELLpin PIN_A1 // the LDR will be connected to analog 1
 #else
@@ -39,8 +48,11 @@
 typedef struct {
    byte nodeid;  // Node ID
    byte id;      // Packet ID
-   int temp;	 // Temperature reading
+   int temp1;	   // Temperature reading  Probe 1
    unsigned int supplyV;	// Supply voltage
+#ifdef AS_TWO_TEMP_PROBES
+   int temp2;	   // Temperature reading  Probe 2
+#endif
    byte numsensors;
 #ifdef AS_PHOTOCELL
    byte photocell;
@@ -136,11 +148,15 @@ static int readDS18120(void)
   pinMode(tempPower, OUTPUT); // set power pin for DS18B20 to output  
   digitalWrite(tempPower, HIGH); // turn DS18B20 sensor on
   Sleepy::loseSomeTime(20); // Allow 10ms for the sensor to be ready
-  sensors.requestTemperatures(); // Send the command to get temperatures  
-  result = sensors.getTempCByIndex(0)*100; // read sensor 1
+  sensors.requestTemperatures(); // Send the command to get temperatures
+  
+  staticpayload.temp1 = sensors.getTempCByIndex(0)*100; // Read Probe 1
+#ifdef AS_TWO_TEMP_PROBES
+  staticpayload.temp2 = sensors.getTempCByIndex(1)*100; // Read Probe 2
+#endif
+
   digitalWrite(tempPower, LOW); // turn DS18B20 sensor off
   pinMode(tempPower, INPUT);
-  return result;
 }
 
 static void blinkLED(int ntimes, int time){
@@ -235,7 +251,8 @@ void loop() {
    Sleepy::loseSomeTime(16); // Allow 10ms for the sensor to be ready
   
    staticpayload.supplyV = vccRead(4);
-   staticpayload.temp = readDS18120();
+   // staticpayload temp1 & temp2 set according configuration
+   readDS18120();
 
 #ifdef AS_PHOTOCELL
    // Need to enable the pull-up to get a voltage drop over the LDR
