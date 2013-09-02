@@ -8,19 +8,38 @@
 #include "pins_arduino.h"
 #include <avr/sleep.h>
 
+#include <EEPROM.h>
+
 //########################################################################################################################
 // Default Configuration
 //########################################################################################################################
-#define destNodeID 1
-#define myNodeID 30      // RF12 node ID in the range 1-30
+//#define myNodeID 30      // RF12 node ID in the range 1-30
 // 17 for LDC
 #define AS_PHOTOCELL 1
-//#define AS_TWO_TEMP_PROBES 1
+#define AS_TWO_TEMP_PROBES 1
 #define STATIC_ONEWIRE_INDEXES 1 // Save time and 118 Bytes of code : good for ATTiny !
+
+//########################################################################################################################
+// OTA Configuration
+//########################################################################################################################
+// ID of the settings block
+#define CONFIG_VERSION "tom" //keep this 3 chars long
+#define CONFIG_START 32      // Offset of the configuration in EEPROM
+
+struct StoreStruct {
+  // This is for mere detection if they are your settings
+  char version[4];  // 3+trailing zero
+  byte myNodeID, needACK, loopIterations, loopDuration;
+} storage = {
+  CONFIG_VERSION,
+  // The default values
+  30, false, 5, 1
+};
 
 //########################################################################################################################
 // General Configuration
 //########################################################################################################################
+#define destNodeID 1
 #define network 100      // RF12 Network group
 #define freq RF12_868MHZ // Frequency of RFM12B module
 
@@ -70,8 +89,12 @@ static unsigned int vccRead(unsigned int count);
 static unsigned int adcMeanRead(byte adcmux, unsigned int count, bool tovdc);
 #endif
 static int readDS18120(void);
-static void blinkLED(int ntimes, int time);
-void RF_air_send(Payload_t *pl);
+static void blinkLED(byte ntimes, byte time);
+void RF_AirSend(Payload_t *pl);
+
+// Special for configuration
+void loadConfig();
+void saveConfig();
 
 //########################################################################################################################
 // Local variables
@@ -149,7 +172,6 @@ static unsigned int adcMeanRead(byte adcmux, unsigned int count = 10, bool tovdc
 
 static int readDS18120(void)
 {
-  int result = 0;
   pinMode(tempPower, OUTPUT);     // set power pin for DS18B20 to output  
   digitalWrite(tempPower, HIGH);  // turn DS18B20 sensor on
   loseSomeTime(20);               // Allow 10ms for the sensor to be ready
@@ -157,23 +179,21 @@ static int readDS18120(void)
   loseSomeTime(ASYNC_DELAY);           // Must wait for conversion, since we use ASYNC mode
   
 #ifdef STATIC_ONEWIRE_INDEXES 
-  staticpayload.temp1 = sensors.getTempC(allAddress[0])*100; // Read Probe 1
-#ifdef AS_TWO_TEMP_PROBES
-  staticpayload.temp2 = sensors.getTempC(allAddress[1])*100; // Read Probe 2
-#endif
+  staticpayload.temp1 = sensors.getTempC(allAddress[0])*100;   // Read Probe 1
+  if(staticpayload.numsensors > 1)
+    staticpayload.temp2 = sensors.getTempC(allAddress[1])*100; // Read Probe 2
 #else  
-  staticpayload.temp1 = sensors.getTempCByIndex(0)*100; // Read Probe 1
-#ifdef AS_TWO_TEMP_PROBES
-  staticpayload.temp2 = sensors.getTempCByIndex(1)*100; // Read Probe 2
-#endif
+  staticpayload.temp1 = sensors.getTempCByIndex(0)*100;   // Read Probe 1
+  if(staticpayload.numsensors > 1)
+    staticpayload.temp2 = sensors.getTempCByIndex(1)*100; // Read Probe 2
 #endif
 
   digitalWrite(tempPower, LOW); // turn DS18B20 sensor off
   pinMode(tempPower, INPUT);
 }
 
-static void blinkLED(int ntimes, int time){
-  for (int i = 0; i <= ntimes; ++i) {
+static void blinkLED(byte ntimes, byte time){
+  for (byte i = 0; i <= ntimes; ++i) {
       digitalWrite(LEDpin,LOW);
       loseSomeTime(time/2);
       //delay(time/2);
@@ -181,13 +201,12 @@ static void blinkLED(int ntimes, int time){
       //delay(time/2);
       loseSomeTime(time/2);
   }
-  //delay(1000);
 }
 
 //--------------------------------------------------------------------------------------------------
 // Send payload data via RF
 //--------------------------------------------------------------------------------------------------
-void RF_air_send(Payload_t *pl){
+void RF_AirSend(Payload_t *pl){
    bitClear(PRR, PRUSI); // enable USI h/w
    digitalWrite(LEDpin, LOW);
    
@@ -231,8 +250,10 @@ void setup() {
    CLKPR = 1; // div 2, i.e. slow down to 8 MHz
 #endif
    sei();
+   
+   loadConfig();
   
-   rf12_initialize(myNodeID,freq,network); // Initialize RFM12 with settings defined above 
+   rf12_initialize(storage.myNodeID, freq, network); // Initialize RFM12 with settings defined above 
    // Adjust low battery voltage to 2.2V
    rf12_control(0xC040);
    rf12_sleep(RF12_SLEEP);  // Put the RFM12 to sleep
@@ -284,20 +305,20 @@ void loop() {
 #endif
    bitSet(PRR, PRADC); // power down the ADC
 
-   staticpayload.nodeid = myNodeID;
+   staticpayload.nodeid = storage.myNodeID;
    staticpayload.id += 1;
     
-   RF_air_send(&staticpayload);
+   RF_AirSend(&staticpayload);
   
-   for (byte i = 0; i < 5; ++i)
-     //loseSomeTime(60*1000);
-     loseSomeTime(1*1000);
+   // Controlled by Configuration !
+   for (byte i = 0; i < storage.loopIterations; ++i)
+     loseSomeTime(storage.loopDuration*1000);
 }
 
 static byte waitForAck() {
   MilliTimer ackTimer;
   while (!ackTimer.poll(ACK_TIME)) {
-   if (rf12_recvDone() && rf12_crc == 0 && rf12_hdr == (RF12_HDR_DST | RF12_HDR_CTL | myNodeID))
+   if (rf12_recvDone() && rf12_crc == 0 && rf12_hdr == (RF12_HDR_DST | RF12_HDR_CTL | storage.myNodeID))
      return 1;
    }
    return 0;
@@ -315,4 +336,22 @@ void loseSomeTime(unsigned int ms){
     ADMUX=oldADMUX;    
 }
 
+//########################################################################################################################
+// Configuration functions
+//########################################################################################################################
+void loadConfig() {
+  // To make sure there are settings, and they are ours. If nothing is found it will use the default settings.
+  if (EEPROM.read(CONFIG_START + 0) == CONFIG_VERSION[0] &&
+      EEPROM.read(CONFIG_START + 1) == CONFIG_VERSION[1] &&
+      EEPROM.read(CONFIG_START + 2) == CONFIG_VERSION[2])
+  {
+      for (unsigned int t=0; t<sizeof(storage); t++)
+        *((char*)&storage + t) = EEPROM.read(CONFIG_START + t);
+  }
+}
+
+void saveConfig() {
+  for (unsigned int t=0; t<sizeof(storage); t++)
+    EEPROM.write(CONFIG_START + t, *((char*)&storage + t));
+}
 
