@@ -16,7 +16,7 @@
 //#define myNodeID 30      // RF12 node ID in the range 1-30
 // 17 for LDC
 #define AS_PHOTOCELL 1
-#define AS_TWO_TEMP_PROBES 1
+//#define AS_TWO_TEMP_PROBES 1
 #define STATIC_ONEWIRE_INDEXES 1 // Save time and 118 Bytes of code : good for ATTiny !
 
 //########################################################################################################################
@@ -39,14 +39,16 @@ struct StoreStruct {
 //########################################################################################################################
 // General Configuration
 //########################################################################################################################
-#define destNodeID 1
-#define network 100      // RF12 Network group
+#define destNodeID 1      // Valid for both rootNode and confNode
+#define productionNetwork 100
+#define configurationNetwork 200
+//#define network 100      // RF12 Network group
 #define freq RF12_868MHZ // Frequency of RFM12B module
 
 #define NEED_ACK 0
 #define RETRY_PERIOD 5    // How soon to retry (in seconds) if ACK didn't come in
 #define RETRY_LIMIT 5     // Maximum number of times to retry
-#define ACK_TIME 10       // Number of milliseconds to wait for an ack
+#define ACK_TIME 100       // Number of milliseconds to wait for an ack
 
 #include <OneWire.h>   // http://www.pjrc.com/teensy/arduino_libraries/OneWire.zip
 #include <DallasTemperature.h>  // http://download.milesburton.com/Arduino/MaximTemperature/DallasTemperature_371Beta.zip
@@ -88,7 +90,7 @@ static unsigned int vccRead(unsigned int count);
 #else
 static unsigned int adcMeanRead(byte adcmux, unsigned int count, bool tovdc);
 #endif
-static int readDS18120(void);
+static void readDS18120(void);
 static void blinkLED(byte ntimes, byte time);
 void RF_AirSend(Payload_t *pl);
 
@@ -106,7 +108,7 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 #ifdef STATIC_ONEWIRE_INDEXES
 // addresses of sensors, MAX 4!!  
-byte allAddress [4][8];  // 8 bytes per address
+byte allAddress [3][8];  // 8 bytes per address
 #endif
 
 volatile bool adcDone;
@@ -170,7 +172,7 @@ static unsigned int adcMeanRead(byte adcmux, unsigned int count = 10, bool tovdc
 #endif
 }
 
-static int readDS18120(void)
+static void readDS18120(void)
 {
   pinMode(tempPower, OUTPUT);     // set power pin for DS18B20 to output  
   digitalWrite(tempPower, HIGH);  // turn DS18B20 sensor on
@@ -180,12 +182,16 @@ static int readDS18120(void)
   
 #ifdef STATIC_ONEWIRE_INDEXES 
   staticpayload.temp1 = sensors.getTempC(allAddress[0])*100;   // Read Probe 1
+#ifdef AS_TWO_TEMP_PROBES
   if(staticpayload.numsensors > 1)
     staticpayload.temp2 = sensors.getTempC(allAddress[1])*100; // Read Probe 2
+#endif
 #else  
   staticpayload.temp1 = sensors.getTempCByIndex(0)*100;   // Read Probe 1
+#ifdef AS_TWO_TEMP_PROBES
   if(staticpayload.numsensors > 1)
     staticpayload.temp2 = sensors.getTempCByIndex(1)*100; // Read Probe 2
+#endif
 #endif
 
   digitalWrite(tempPower, LOW); // turn DS18B20 sensor off
@@ -196,9 +202,7 @@ static void blinkLED(byte ntimes, byte time){
   for (byte i = 0; i <= ntimes; ++i) {
       digitalWrite(LEDpin,LOW);
       loseSomeTime(time/2);
-      //delay(time/2);
       digitalWrite(LEDpin,HIGH);
-      //delay(time/2);
       loseSomeTime(time/2);
   }
 }
@@ -207,32 +211,38 @@ static void blinkLED(byte ntimes, byte time){
 // Send payload data via RF
 //--------------------------------------------------------------------------------------------------
 void RF_AirSend(Payload_t *pl){
-   bitClear(PRR, PRUSI); // enable USI h/w
-   digitalWrite(LEDpin, LOW);
+  bitClear(PRR, PRUSI); // enable USI h/w
+  digitalWrite(LEDpin, LOW);
    
-   for (byte i = 0; i <= RETRY_LIMIT; ++i) {  // tx and wait for ack up to RETRY_LIMIT times
+  for (byte i = 0; i <= RETRY_LIMIT; ++i) {  // tx and wait for ack up to RETRY_LIMIT times
        rf12_sleep(RF12_WAKEUP);
-       int i = 1; 
-       while (!rf12_canSend() && i<10) {rf12_recvDone(); i++;}
-              
+       //int i = 1; 
+       //while (!rf12_canSend() && i<10) {rf12_recvDone(); i++;}            
        byte header = RF12_HDR_ACK | RF12_HDR_DST | destNodeID;
   
-       rf12_sendStart(header, pl, sizeof *pl);
+       rf12_sendNow(header, pl, sizeof *pl);
        rf12_sendWait(2); // Wait for RF to finish sending while in standby mode
 #if NEED_ACK
-       byte acked = waitForAck();  // Wait for ACK
+//       if(needACK){
+         byte acked = waitForAck();  // Wait for ACK
+//       }
 #endif
        rf12_sleep(RF12_SLEEP);
 #if NEED_ACK
-       if (acked) { break; }      // Return if ACK received
-       loseSomeTime(RETRY_PERIOD * 500);     // If no ack received wait and try again
+//       if(needACK){
+         if (acked) { break; }      // Return if ACK received
+         loseSomeTime(RETRY_PERIOD * 500);     // If no ack received wait and try again
+//       }
+//       else
+//       {
 #else
-        break;
+          break;
+//       }
 #endif
-   } 
+  } 
    
-   digitalWrite(LEDpin, HIGH);
-   bitSet(PRR, PRUSI); // disable USI h/w
+  digitalWrite(LEDpin, HIGH);
+  bitSet(PRR, PRUSI); // disable USI h/w
 }
 
 //########################################################################################################################
@@ -251,9 +261,13 @@ void setup() {
 #endif
    sei();
    
+   // Special configuration mode
+   rf12_initialize(storage.myNodeID, freq, configurationNetwork);
+   listenConfig();
+   
    loadConfig();
   
-   rf12_initialize(storage.myNodeID, freq, network); // Initialize RFM12 with settings defined above 
+   rf12_initialize(storage.myNodeID, freq, productionNetwork); // Initialize RFM12 with settings defined above 
    // Adjust low battery voltage to 2.2V
    rf12_control(0xC040);
    rf12_sleep(RF12_SLEEP);  // Put the RFM12 to sleep
@@ -318,9 +332,9 @@ void loop() {
 static byte waitForAck() {
   MilliTimer ackTimer;
   while (!ackTimer.poll(ACK_TIME)) {
-   if (rf12_recvDone() && rf12_crc == 0 && rf12_hdr == (RF12_HDR_DST | RF12_HDR_CTL | storage.myNodeID))
+   if (rf12_recvDone() && rf12_crc == 0 && rf12_hdr == (RF12_HDR_CTL | destNodeID))
      return 1;
-   }
+  }
    return 0;
 }
 
@@ -355,3 +369,43 @@ void saveConfig() {
     EEPROM.write(CONFIG_START + t, *((char*)&storage + t));
 }
 
+void listenConfig(void){
+  // Send a Bottle to the see
+  bitClear(PRR, PRUSI); // enable USI h/w
+  blinkLED(2, 25);
+   
+  for (byte j = 0; j <= 5; ++j) {
+      blinkLED(1, 50);
+
+      rf12_sleep(RF12_WAKEUP);
+              
+      int ask_for_configuration = 0xCAFE;
+      rf12_sendNow((RF12_HDR_ACK | RF12_HDR_DST | destNodeID), &ask_for_configuration, 2);
+      rf12_sendWait(2); // Wait for RF to finish sending while in standby mode
+      byte acked = waitForAck();  // Wait for ACK
+      rf12_sleep(RF12_SLEEP);
+
+      // Ok some one
+      if (acked) { 
+          do {
+              blinkLED(1, 50);
+              loseSomeTime(250);
+              
+              if (rf12_recvDone() && rf12_len == 6 && rf12_data[0] == 0xDE && rf12_data[1] == 0xCA) {
+                  storage.myNodeID = rf12_data[2];
+                  storage.needACK = rf12_data[3];
+                  storage.loopIterations = rf12_data[4];
+                  storage.loopDuration = rf12_data[5];
+                  saveConfig();
+                  j = 6;
+                  break;
+              }
+          }while(1);
+      } else {
+        loseSomeTime(1 * 1000);
+      }
+  }
+   
+  blinkLED(2, 25);
+  bitSet(PRR, PRUSI); // disable USI h/w
+}
